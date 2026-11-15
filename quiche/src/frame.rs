@@ -432,24 +432,26 @@ impl Frame {
 
             0x30 | 0x31 => parse_datagram_frame(frame_type, b)?,
 
-            0x15228c00..=0x15228c01 => parse_path_ack_frame(frame_type, b)?,
+            0x3e..=0x3f | 0x15228c00..=0x15228c01 => {
+                parse_path_ack_frame(frame_type, b)?
+            },
 
-            0x15228c05 => Frame::PathAbandon {
+            0x3e75 | 0x15228c05 => Frame::PathAbandon {
                 path_id: b.get_varint()?,
                 error_code: b.get_varint()?,
             },
 
-            0x15228c07 => Frame::PathBackup {
+            0x3e76 | 0x15228c07 => Frame::PathBackup {
                 path_id: b.get_varint()?,
                 seq_num: b.get_varint()?,
             },
 
-            0x15228c08 => Frame::PathAvailable {
+            0x3e77 | 0x15228c08 => Frame::PathAvailable {
                 path_id: b.get_varint()?,
                 seq_num: b.get_varint()?,
             },
 
-            0x15228c09 => {
+            0x3e78 | 0x15228c09 => {
                 let path_id = b.get_varint()?;
                 let seq_num = b.get_varint()?;
                 let retire_prior_to = b.get_varint()?;
@@ -472,20 +474,20 @@ impl Frame {
                 }
             },
 
-            0x15228c0a => Frame::PathRetireConnectionId {
+            0x3e79 | 0x15228c0a => Frame::PathRetireConnectionId {
                 path_id: b.get_varint()?,
                 seq_num: b.get_varint()?,
             },
 
-            0x15228c0c => Frame::MaxPathId {
+            0x3e7a | 0x15228c0c => Frame::MaxPathId {
                 max_path_id: b.get_varint()?,
             },
 
-            0x15228c0d => Frame::PathsBlocked {
+            0x3e7b | 0x15228c0d => Frame::PathsBlocked {
                 max_path_id: b.get_varint()?,
             },
 
-            0x15228c0e => Frame::PathCidsBlocked {
+            0x3e7c | 0x15228c0e => Frame::PathCidsBlocked {
                 path_id: b.get_varint()?,
                 next_seq_num: b.get_varint()?,
             },
@@ -632,6 +634,12 @@ impl Frame {
     }
 
     pub fn to_bytes(&self, b: &mut octets::OctetsMut) -> Result<usize> {
+        self.to_bytes_mp(b, false)
+    }
+
+    pub fn to_bytes_mp(
+        &self, b: &mut octets::OctetsMut, use_0x3e: bool,
+    ) -> Result<usize> {
         let before = b.cap();
 
         match self {
@@ -835,11 +843,13 @@ impl Frame {
                 ranges,
                 ecn_counts,
             } => {
-                if ecn_counts.is_none() {
-                    b.put_varint(0x15228c00)?;
-                } else {
-                    b.put_varint(0x15228c01)?;
-                }
+                let ty = match (use_0x3e, ecn_counts.is_none()) {
+                    (true, true) => 0x3e,
+                    (true, false) => 0x3f,
+                    (false, true) => 0x15228c00,
+                    (false, false) => 0x15228c01,
+                };
+                b.put_varint(ty)?;
                 b.put_varint(*path_identifier)?;
                 common_ack_to_bytes(b, ack_delay, ranges, ecn_counts)?;
             },
@@ -848,21 +858,21 @@ impl Frame {
                 path_id,
                 error_code,
             } => {
-                b.put_varint(0x15228c05)?;
+                b.put_varint(if use_0x3e { 0x3e75 } else { 0x15228c05 })?;
 
                 b.put_varint(*path_id)?;
                 b.put_varint(*error_code)?;
             },
 
             Frame::PathBackup { path_id, seq_num } => {
-                b.put_varint(0x15228c07)?;
+                b.put_varint(if use_0x3e { 0x3e76 } else { 0x15228c07 })?;
 
                 b.put_varint(*path_id)?;
                 b.put_varint(*seq_num)?;
             },
 
             Frame::PathAvailable { path_id, seq_num } => {
-                b.put_varint(0x15228c08)?;
+                b.put_varint(if use_0x3e { 0x3e77 } else { 0x15228c08 })?;
 
                 b.put_varint(*path_id)?;
                 b.put_varint(*seq_num)?;
@@ -875,7 +885,7 @@ impl Frame {
                 conn_id,
                 reset_token,
             } => {
-                b.put_varint(0x15228c09)?;
+                b.put_varint(if use_0x3e { 0x3e78 } else { 0x15228c09 })?;
 
                 b.put_varint(*path_id)?;
                 b.put_varint(*seq_num)?;
@@ -886,20 +896,20 @@ impl Frame {
             },
 
             Frame::PathRetireConnectionId { path_id, seq_num } => {
-                b.put_varint(0x15228c0a)?;
+                b.put_varint(if use_0x3e { 0x3e79 } else { 0x15228c0a })?;
 
                 b.put_varint(*path_id)?;
                 b.put_varint(*seq_num)?;
             },
 
             Frame::MaxPathId { max_path_id } => {
-                b.put_varint(0x15228c0c)?;
+                b.put_varint(if use_0x3e { 0x3e7a } else { 0x15228c0c })?;
 
                 b.put_varint(*max_path_id)?;
             },
 
             Frame::PathsBlocked { max_path_id } => {
-                b.put_varint(0x15228c0d)?;
+                b.put_varint(if use_0x3e { 0x3e7b } else { 0x15228c0d })?;
 
                 b.put_varint(*max_path_id)?;
             },
@@ -908,7 +918,7 @@ impl Frame {
                 path_id,
                 next_seq_num: next_sequence_number,
             } => {
-                b.put_varint(0x15228c0e)?;
+                b.put_varint(if use_0x3e { 0x3e7c } else { 0x15228c0e })?;
 
                 b.put_varint(*path_id)?;
                 b.put_varint(*next_sequence_number)?;
@@ -1008,6 +1018,10 @@ impl Frame {
     }
 
     pub fn wire_len(&self) -> usize {
+        self.wire_len_mp(false)
+    }
+
+    pub fn wire_len_mp(&self, use_0x3e: bool) -> usize {
         match self {
             Frame::Padding { len } => *len,
 
@@ -1196,7 +1210,7 @@ impl Frame {
                 ranges,
                 ecn_counts,
             } => {
-                4 + // frame_type
+                (if use_0x3e { 1 } else { 4 }) + // frame_type
                 octets::varint_len(*path_identifier) + // path_identifier
                 common_ack_wire_len(ack_delay, ranges, ecn_counts)
             },
@@ -1205,19 +1219,19 @@ impl Frame {
                 path_id,
                 error_code,
             } => {
-                4 + // frame type
+                (if use_0x3e { 2 } else { 4 }) + // frame type
                 octets::varint_len(*path_id) +
                 octets::varint_len(*error_code)
             },
 
             Frame::PathBackup { path_id, seq_num } => {
-                4 + // frame size
+                (if use_0x3e { 2 } else { 4 }) + // frame size
                 octets::varint_len(*path_id) +
                 octets::varint_len(*seq_num)
             },
 
             Frame::PathAvailable { path_id, seq_num } => {
-                4 + // frame size
+                (if use_0x3e { 2 } else { 4 }) + // frame size
                 octets::varint_len(*path_id) +
                 octets::varint_len(*seq_num)
             },
@@ -1229,7 +1243,7 @@ impl Frame {
                 conn_id,
                 reset_token,
             } => {
-                4 + // frame type
+                (if use_0x3e { 2 } else { 4 }) + // frame type
                 octets::varint_len(*path_id) + // path_id
                 octets::varint_len(*seq_num) + // seq_num
                 octets::varint_len(*retire_prior_to) + // retire_prior_to
@@ -1239,18 +1253,18 @@ impl Frame {
             },
 
             Frame::PathRetireConnectionId { path_id, seq_num } => {
-                4 + // frame type
+                (if use_0x3e { 2 } else { 4 }) + // frame type
                 octets::varint_len(*path_id) + // path_id
                 octets::varint_len(*seq_num) // seq_num
             },
 
             Frame::MaxPathId { max_path_id } => {
-                4 + // frame type
+                (if use_0x3e { 2 } else { 4 }) + // frame type
                 octets::varint_len(*max_path_id) // path_id
             },
 
             Frame::PathsBlocked { max_path_id } => {
-                4 + // frame type
+                (if use_0x3e { 2 } else { 4 }) + // frame type
                 octets::varint_len(*max_path_id) // path_id
             },
 
@@ -1258,7 +1272,7 @@ impl Frame {
                 path_id,
                 next_seq_num,
             } => {
-                4 + // frame type
+                (if use_0x3e { 2 } else { 4 }) + // frame type
                 octets::varint_len(*path_id) + // path_id
                 octets::varint_len(*next_seq_num) // next_seq_num
             },

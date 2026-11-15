@@ -1,5 +1,6 @@
 //! Flexicast QUIC receiver wrapped in tokio.
 
+use crate::amt::AmtGateway;
 use crate::Result;
 use log::*;
 use quiche::flexicast::FlexicastConnection;
@@ -15,6 +16,7 @@ use std::net;
 use std::net::Ipv4Addr;
 use std::net::SocketAddr;
 use std::net::SocketAddrV4;
+use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
@@ -55,6 +57,15 @@ pub struct TokioFcQuicRecv {
 
     /// Potential HTTP/3 pending request.
     h3_pending_request: Option<Vec<Header>>,
+
+    /// Whether AMT fallback is allowed when native multicast packets do not arrive.
+    amt_fallback_allowed: bool,
+
+    /// Optional AMT relay IPv4 address.
+    amt_relay_ip: Option<Ipv4Addr>,
+
+    /// Delay without native multicast packets before falling back to AMT.
+    amt_fallback_delay: Duration,
 }
 
 impl TokioFcQuicRecv {
@@ -62,7 +73,8 @@ impl TokioFcQuicRecv {
     pub fn new(
         peer_addr: SocketAddr, config: Config, local_ip: Ipv4Addr,
         flexicast: bool, proxy_uc: bool, rx_from_app: mpsc::Receiver<FcQuicMsg>,
-        h3_config: Option<quiche::h3::Config>,
+        h3_config: Option<quiche::h3::Config>, amt_fallback_allowed: bool,
+        amt_relay_ip: Option<Ipv4Addr>,
     ) -> (Self, mpsc::Receiver<FcQuicMsg>) {
         let (tx_app, rx_app) = mpsc::channel(CHANNEL_BUFFER_SIZE);
         (
@@ -77,15 +89,26 @@ impl TokioFcQuicRecv {
                 h3_config,
                 h3_conn: None,
                 h3_pending_request: None,
+                amt_fallback_allowed,
+                amt_relay_ip,
+                amt_fallback_delay: Duration::from_millis(750),
             },
             rx_app,
         )
+    }
+
+    /// Overrides the inactivity timeout before falling back to AMT.
+    pub fn with_amt_fallback_delay(mut self, delay: Duration) -> Self {
+        self.amt_fallback_delay = delay;
+        self
     }
 
     /// Asynchronously runs the Flexicast QUIC receiver, sending data to the
     /// application.
     pub async fn run(&mut self) -> crate::Result<()> {
         let mut buf = [0; 65535];
+        let mut mc_buf = [0; 65535];
+        let mut amt_buf = [0; 65535];
         let mut out = [0; MAX_DATAGRAM_SIZE];
 
         // Creation of the flexicast path.
@@ -95,6 +118,11 @@ impl TokioFcQuicRecv {
         let mut mc_socket_opt: Option<UdpSocket> = None;
         let mut joined_mc_ip = false;
         let mc_addr: SocketAddr = "0.0.0.0:4433".parse()?;
+
+        // AMT fallback state.
+        let mut amt_gw: Option<AmtGateway> = None;
+        let mut amt_fallback_deadline: Option<tokio::time::Instant> = None;
+        let mut mc_group_info: Option<(Ipv4Addr, Ipv4Addr, u16, bool)> = None;
 
         // Create the UDP socket backing the QUIC connection.
         let bind_addr: std::net::SocketAddr = "0.0.0.0:0".parse()?;
@@ -147,8 +175,13 @@ impl TokioFcQuicRecv {
 
         loop {
             let timeout = conn.timeout();
+            let amt_timeout = amt_gw
+                .as_ref()
+                .map(|gw| gw.next_timeout().max(Duration::from_millis(10)));
             let mut read_uc = false;
             let mut read_mc = false;
+            let mut read_amt = false;
+            let mut trigger_amt_fallback = false;
 
             tokio::select! {
                 Some(_) = optional_timeout(timeout) => {
@@ -165,19 +198,86 @@ impl TokioFcQuicRecv {
                     read_uc = true;
                 },
 
-                Ok((len, from)) = optional_recv_from(mc_socket_opt.as_ref(), &mut out) => {
+                Ok((len, from)) = optional_recv_from(mc_socket_opt.as_ref(), &mut mc_buf), if mc_socket_opt.is_some() => {
+                    if amt_gw.is_none() && self.amt_fallback_allowed && amt_fallback_deadline.is_some() {
+                        amt_fallback_deadline = Some(tokio::time::Instant::now() + self.amt_fallback_delay);
+                    }
                     let recv_info = quiche::RecvInfo {
                         to: mc_addr,
-                        from,
+                        from: normalize_mc_from(from, mc_group_info),
                         from_mc: true,
                     };
-                    conn.recv(&mut out[..len], recv_info)?;
+                    conn.recv(&mut mc_buf[..len], recv_info)?;
                     read_mc = true;
+                },
+
+                res = optional_amt_recv(amt_gw.as_mut(), &mut amt_buf), if amt_gw.is_some() => {
+                    match res {
+                        Ok((len, from)) => {
+                            let recv_info = quiche::RecvInfo {
+                                to: mc_addr,
+                                from: normalize_mc_from(from, mc_group_info),
+                                from_mc: true,
+                            };
+                            conn.recv(&mut amt_buf[..len], recv_info)?;
+                            read_amt = true;
+                        },
+                        Err(e) => {
+                            warn!("AMT recv error: {}", e);
+                        },
+                    }
+                },
+
+                _ = optional_sleep_until(amt_fallback_deadline), if amt_fallback_deadline.is_some() && amt_gw.is_none() => {
+                    amt_fallback_deadline = None;
+                    trigger_amt_fallback = true;
+                },
+
+                _ = optional_sleep_delay(amt_timeout), if amt_timeout.is_some() => {
+                    if let Some(gw) = amt_gw.as_mut() {
+                        if let Err(e) = gw.on_timeout() {
+                            warn!("AMT refresh timeout failed: {}", e);
+                        } else {
+                            debug!("AMT proactive refresh Request sent");
+                        }
+                    }
                 },
 
                 Some(msg) = self.rx_app.recv() => {
                     if self.recv_app_msg(msg)? {
                         conn.close(true, 0x00, b"bye")?;
+                    }
+                }
+            }
+
+            if trigger_amt_fallback {
+                if let (Some(relay_ip), Some((group_ip, src_ip, udp_port, _))) = (self.amt_relay_ip, mc_group_info) {
+                    info!(
+                        "No native multicast packets received within {:?}; falling back to AMT relay {} for group {} (source {})",
+                        self.amt_fallback_delay, relay_ip, group_ip, src_ip
+                    );
+                    let relay_addr = SocketAddr::V4(SocketAddrV4::new(relay_ip, 2268));
+                    let group_addr = SocketAddr::V4(SocketAddrV4::new(group_ip, udp_port));
+                    let source_addr = SocketAddr::V4(SocketAddrV4::new(src_ip, 0));
+                    match AmtGateway::open(relay_addr, group_addr, Some(source_addr), true, 1000, 3).await {
+                        Ok(gw) => {
+                            info!(
+                                "AMT tunnel established via relay {} for ({}, {}:{})",
+                                relay_ip, src_ip, group_ip, udp_port
+                            );
+                            if let Some(mc_sock) = mc_socket_opt.take() {
+                                if let Err(e) = mc_sock.leave_multicast_v4(group_ip, self.local_ip) {
+                                    debug!("leave_multicast_v4({}) ignored: {}", group_ip, e);
+                                }
+                                info!("Left MULTICAST group {}", group_ip);
+                                info!("Left multicast group after creating AMT gateway");
+                            }
+                            amt_gw = Some(gw);
+                        },
+                        Err(e) => {
+                            error!("AMT fallback failed to open tunnel to {}: {}; will retry", relay_ip, e);
+                            amt_fallback_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(5));
+                        },
                     }
                 }
             }
@@ -219,9 +319,12 @@ impl TokioFcQuicRecv {
                     'mc_read: loop {
                         if let Ok((len, from)) = mc_socket.try_recv_from(&mut buf)
                         {
+                            if amt_gw.is_none() && self.amt_fallback_allowed && amt_fallback_deadline.is_some() {
+                                amt_fallback_deadline = Some(tokio::time::Instant::now() + self.amt_fallback_delay);
+                            }
                             let recv_info = quiche::RecvInfo {
                                 to: mc_addr,
-                                from,
+                                from: normalize_mc_from(from, mc_group_info),
                                 from_mc: true,
                             };
                             conn.recv(&mut buf[..len], recv_info)?;
@@ -231,6 +334,39 @@ impl TokioFcQuicRecv {
                         i += 1;
                         if i > nb_read_max {
                             debug!("READ {i} packets through MC. Going out...");
+                            break;
+                        }
+                    }
+                }
+            }
+            i = 0;
+            if read_amt {
+                if let Some(gw) = amt_gw.as_mut() {
+                    'amt_read: loop {
+                        match gw.try_recv(&mut buf) {
+                            Ok(Some((len, from, _to))) => {
+                                let recv_info = quiche::RecvInfo {
+                                    to: mc_addr,
+                                    from: normalize_mc_from(from, mc_group_info),
+                                    from_mc: true,
+                                };
+                                conn.recv(&mut buf[..len], recv_info)?;
+                            },
+                            Ok(None) => {
+                                // Control message handled internally; keep draining.
+                                continue;
+                            },
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                break 'amt_read;
+                            },
+                            Err(e) => {
+                                warn!("AMT try_recv error: {}", e);
+                                break 'amt_read;
+                            },
+                        }
+                        i += 1;
+                        if i > nb_read_max {
+                            debug!("READ {i} packets through AMT. Going out...");
                             break;
                         }
                     }
@@ -265,6 +401,13 @@ impl TokioFcQuicRecv {
                     if !probe_mc_path && added_mc_cid {
                         debug!("Create the second path. Client addr={:?}. Server addr={:?}", mc_addr, self.peer_addr);
                         let src_ip = Ipv4Addr::from(mc_announce_data.source_ip);
+                        let group_ip_v4 = Ipv4Addr::from(mc_announce_data.group_ip);
+                        mc_group_info = Some((
+                            group_ip_v4,
+                            src_ip,
+                            mc_announce_data.udp_port,
+                            mc_announce_data.probe_path,
+                        ));
                         let src_addr =
                             SocketAddr::V4(SocketAddrV4::new(src_ip, 4443));
                         let fc_path_id = conn.create_mc_path(
@@ -272,7 +415,7 @@ impl TokioFcQuicRecv {
                             src_addr,
                             mc_announce_data.probe_path,
                         );
-                        println!("Out of create mc path:{:?}", fc_path_id);
+                        debug!("Out of create mc path:{:?}", fc_path_id);
                         if let Ok(fc_path_id) = fc_path_id {
                             conn.fc_set_path_id(Some(fc_path_id))?;
 
@@ -304,15 +447,25 @@ impl TokioFcQuicRecv {
                                     ))
                                 };
 
-			    let mc_socket =
-                                UdpSocket::bind(mc_group_sockaddr).await?;
+                            match bind_mc_socket(mc_group_sockaddr) {
+                                Ok(mc_socket) => {
+                                    info!(
+                                        "Multicast client binds on address: {:?}",
+                                        mc_group_sockaddr
+                                    );
+                                    mc_socket_opt = Some(mc_socket);
+                                },
+                                Err(e) if self.amt_fallback_allowed && self.amt_relay_ip.is_some() => {
+                                    warn!(
+                                        "Failed to bind native multicast socket {:?}: {}; will fall back to AMT",
+                                        mc_group_sockaddr, e
+                                    );
+                                    amt_fallback_deadline = Some(tokio::time::Instant::now());
+                                },
+                                Err(e) => return Err(e.into()),
+                            }
 
-                            info!(
-                                "Multicast client binds on address: {:?}",
-                                mc_group_sockaddr
-                            );
                             probe_mc_path = true;
-                            mc_socket_opt = Some(mc_socket);
 
                             conn.mc_join_channel(
                                 false,
@@ -330,16 +483,38 @@ impl TokioFcQuicRecv {
                         !joined_mc_ip &&
                         !self.proxy_uc
                     {
-                        info!("Join MULTICAST");
-                        mc_socket_opt.as_mut().unwrap().join_multicast_v4(
-                            net::Ipv4Addr::from(
-                                flexicast
-                                    .get_mc_announce_data(0).ok_or("Impossible to fetch the FC_ANNOUNCE_DATA")?
-                                    .group_ip
-                                    .to_owned(),
-                            ),
-                            self.local_ip,
-                        )?;
+                        let group_ip = net::Ipv4Addr::from(
+                            flexicast
+                                .get_mc_announce_data(0).ok_or("Impossible to fetch the FC_ANNOUNCE_DATA")?
+                                .group_ip
+                                .to_owned(),
+                        );
+                        info!("Join MULTICAST {}", group_ip);
+                        if let Some(mc_sock) = mc_socket_opt.as_mut() {
+                            match mc_sock.join_multicast_v4(group_ip, self.local_ip) {
+                                Ok(()) => {
+                                    if self.amt_fallback_allowed {
+                                        if self.amt_relay_ip.is_some() {
+                                            amt_fallback_deadline = Some(
+                                                tokio::time::Instant::now() + self.amt_fallback_delay,
+                                            );
+                                        } else {
+                                            warn!("--amt-fallback enabled without --amt-relay; AMT fallback inactive");
+                                        }
+                                    }
+                                },
+                                Err(e) if self.amt_fallback_allowed && self.amt_relay_ip.is_some() => {
+                                    warn!(
+                                        "join_multicast_v4({}) failed: {}; triggering AMT fallback",
+                                        group_ip, e
+                                    );
+                                    amt_fallback_deadline = Some(tokio::time::Instant::now());
+                                },
+                                Err(e) => return Err(e.into()),
+                            }
+                        } else if self.amt_fallback_allowed && self.amt_relay_ip.is_some() {
+                            amt_fallback_deadline = Some(tokio::time::Instant::now());
+                        }
                         joined_mc_ip = true;
                     }
                 }
@@ -492,9 +667,63 @@ pub async fn optional_timeout(
 
 async fn optional_recv_from(
     opt_sock: Option<&UdpSocket>, buf: &mut [u8],
-) -> Result<(usize, SocketAddr)> {
+) -> std::io::Result<(usize, SocketAddr)> {
     match opt_sock {
-        Some(socket) => socket.recv_from(buf).await.map_err(|e| e.into()),
-        None => Err(Box::new(quiche::Error::Done)),
+        Some(socket) => socket.recv_from(buf).await,
+        None => std::future::pending().await,
     }
+}
+
+async fn optional_amt_recv(
+    opt_gw: Option<&mut AmtGateway>, buf: &mut [u8],
+) -> std::io::Result<(usize, SocketAddr)> {
+    match opt_gw {
+        Some(gw) => {
+            let (len, from, _to) = gw.recv(buf).await?;
+            Ok((len, from))
+        },
+        None => std::future::pending().await,
+    }
+}
+
+async fn optional_sleep_until(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(d) => tokio::time::sleep_until(d).await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn optional_sleep_delay(delay: Option<Duration>) {
+    match delay {
+        Some(d) => tokio::time::sleep(d).await,
+        None => std::future::pending().await,
+    }
+}
+
+fn bind_mc_socket(addr: SocketAddr) -> std::io::Result<UdpSocket> {
+    let domain = match addr {
+        SocketAddr::V4(_) => socket2::Domain::IPV4,
+        SocketAddr::V6(_) => socket2::Domain::IPV6,
+    };
+    let sock = socket2::Socket::new(domain, socket2::Type::DGRAM, None)?;
+    sock.set_reuse_address(true)?;
+    #[cfg(all(unix, not(target_os = "solaris")))]
+    {
+        let _ = sock.set_reuse_port(true);
+    }
+    sock.set_nonblocking(true)?;
+    sock.bind(&addr.into())?;
+    UdpSocket::from_std(sock.into())
+}
+
+fn normalize_mc_from(
+    from: SocketAddr,
+    mc_group_info: Option<(Ipv4Addr, Ipv4Addr, u16, bool)>,
+) -> SocketAddr {
+    if let Some((_, src_ip, _, probe_path)) = mc_group_info {
+        if !probe_path && from.ip() == std::net::IpAddr::V4(src_ip) && from.port() != 4443 {
+            return SocketAddr::V4(SocketAddrV4::new(src_ip, 4443));
+        }
+    }
+    from
 }

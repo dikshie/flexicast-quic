@@ -91,6 +91,8 @@ async fn main() {
         args.proxy_uc,
         rx_app,
         h3_config,
+        false,
+        None,
     );
 
     // Create the receiver application.

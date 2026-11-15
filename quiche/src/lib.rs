@@ -1606,6 +1606,9 @@ pub struct Connection {
     /// Whether the peer's transport parameters were parsed.
     parsed_peer_transport_params: bool,
 
+    /// Whether the peer negotiated IETF multipath TP 0x3e (and 0x3e-series frame IDs).
+    mp_use_0x3e: bool,
+
     /// Whether the connection handshake has been completed.
     handshake_completed: bool,
 
@@ -1855,10 +1858,14 @@ pub fn version_is_supported(version: u32) -> bool {
 /// frame later.
 macro_rules! push_frame_to_pkt {
     ($out:expr, $frames:expr, $frame:expr, $left:expr) => {{
-        if $frame.wire_len() <= $left {
-            $left -= $frame.wire_len();
+        push_frame_to_pkt!($out, $frames, $frame, $left, false)
+    }};
+    ($out:expr, $frames:expr, $frame:expr, $left:expr, $mp_use_0x3e:expr) => {{
+        let frame_len = $frame.wire_len_mp($mp_use_0x3e);
+        if frame_len <= $left {
+            $left -= frame_len;
 
-            $frame.to_bytes(&mut $out)?;
+            $frame.to_bytes_mp(&mut $out, $mp_use_0x3e)?;
 
             $frames.push($frame);
 
@@ -2096,6 +2103,8 @@ impl Connection {
             peer_verified_initial_address: is_server,
 
             parsed_peer_transport_params: false,
+
+            mp_use_0x3e: false,
 
             handshake_completed: false,
 
@@ -4303,6 +4312,7 @@ impl Connection {
         let n_paths = self.paths.len();
         let crypto_space = self.pkt_num_spaces.crypto.get_mut(epoch);
         let multipath_enabled = self.paths.multipath();
+        let mp_use_0x3e = self.mp_use_0x3e;
         let paths = &mut self.paths;
         let path = paths.get(send_pid)?;
         let path_id = path.path_id();
@@ -4547,9 +4557,10 @@ impl Connection {
                 // frames are always 1 byte, so we just need to check that the
                 // PATH_ACK's length is lower than cwnd).
                 if (pns.ack_elicited ||
-                    (left_before_packing_ack_frame - left) + frame.wire_len() <
+                    (left_before_packing_ack_frame - left) +
+                        frame.wire_len_mp(mp_use_0x3e) <
                         cwnd_available) &&
-                    push_frame_to_pkt!(b, frames, frame, left)
+                    push_frame_to_pkt!(b, frames, frame, left, mp_use_0x3e)
                 {
                     pns.ack_elicited = false;
                     wrote_ack_mp = true;
@@ -4592,9 +4603,15 @@ impl Connection {
 
                         if (!ack_elicit_required ||
                             (left_before_packing_ack_frame - left) +
-                                frame.wire_len() <
+                                frame.wire_len_mp(mp_use_0x3e) <
                                 cwnd_available) &&
-                            push_frame_to_pkt!(b, frames, frame, left)
+                            push_frame_to_pkt!(
+                                b,
+                                frames,
+                                frame,
+                                left,
+                                mp_use_0x3e
+                            )
                         {
                             // Continue advertising until we send the
                             // PATH_ACK on its own path, unless the
@@ -4640,7 +4657,13 @@ impl Connection {
                                                * this time */
                         };
 
-                        if push_frame_to_pkt!(b, frames, frame, left) {
+                        if push_frame_to_pkt!(
+                            b,
+                            frames,
+                            frame,
+                            left,
+                            mp_use_0x3e
+                        ) {
                             pns.ack_elicited = false;
 
                             // Receiver sent a PATH_ACK frame. If negative
@@ -4797,7 +4820,7 @@ impl Connection {
                     .ids
                     .get_path_connection_id_frame_for(path_id, seq_num)?;
 
-                if push_frame_to_pkt!(b, frames, frame, left) {
+                if push_frame_to_pkt!(b, frames, frame, left, mp_use_0x3e) {
                     self.ids
                         .mark_advertise_new_scid_seq(path_id, seq_num, false);
 
@@ -5009,7 +5032,7 @@ impl Connection {
                     frame::Frame::RetireConnectionId { seq_num }
                 };
 
-                if push_frame_to_pkt!(b, frames, frame, left) {
+                if push_frame_to_pkt!(b, frames, frame, left, mp_use_0x3e) {
                     self.ids.mark_retire_dcid_seq(path_id, seq_num, false)?;
 
                     ack_eliciting = true;
@@ -5028,7 +5051,7 @@ impl Connection {
                     path_id,
                     error_code,
                 };
-                if push_frame_to_pkt!(b, frames, frame, left) {
+                if push_frame_to_pkt!(b, frames, frame, left, mp_use_0x3e) {
                     paths.on_path_abandon_sent(pid, now)?;
                     // We should also keep in mind that we may retire the last CID
                     // related to Path Id.
@@ -5046,7 +5069,7 @@ impl Connection {
                 let frame = frame::Frame::MaxPathId {
                     max_path_id: self.ids.local_max_paths_id(),
                 };
-                if push_frame_to_pkt!(b, frames, frame, left) {
+                if push_frame_to_pkt!(b, frames, frame, left, mp_use_0x3e) {
                     self.ids.on_max_path_id_sent();
 
                     ack_eliciting = true;
@@ -5061,7 +5084,7 @@ impl Connection {
                 } else {
                     frame::Frame::PathBackup { path_id, seq_num }
                 };
-                if push_frame_to_pkt!(b, frames, frame, left) {
+                if push_frame_to_pkt!(b, frames, frame, left, mp_use_0x3e) {
                     paths.on_path_status_sent();
 
                     ack_eliciting = true;
@@ -5879,7 +5902,8 @@ impl Connection {
                         frame::Frame::from_bytes(&mut written_frames, hdr_ty)?;
                     let wire_len = written_frames.off() - off_before_parsing;
                     packet_fec_protected = true;
-                    let written = frame.to_bytes(&mut fec_buffer)?;
+                    let written =
+                        frame.to_bytes_mp(&mut fec_buffer, mp_use_0x3e)?;
                     if written != wire_len {
                         error!("FEC: did not write the correct amount of bytes");
                         return Err(
@@ -8664,11 +8688,13 @@ impl Connection {
                 let raw_params = self.handshake.quic_transport_params();
 
                 if !self.parsed_peer_transport_params && !raw_params.is_empty() {
-                    let peer_params = TransportParams::decode(
-                        raw_params,
-                        self.is_server,
-                        self.peer_transport_params_track_unknown,
-                    )?;
+                    let (peer_params, mp_use_0x3e) =
+                        TransportParams::decode_with_mp(
+                            raw_params,
+                            self.is_server,
+                            self.peer_transport_params_track_unknown,
+                        )?;
+                    self.mp_use_0x3e = mp_use_0x3e;
 
                     self.parse_peer_transport_params(peer_params)?;
                 }
@@ -8686,11 +8712,12 @@ impl Connection {
         let raw_params = self.handshake.quic_transport_params();
 
         if !self.parsed_peer_transport_params && !raw_params.is_empty() {
-            let peer_params = TransportParams::decode(
+            let (peer_params, mp_use_0x3e) = TransportParams::decode_with_mp(
                 raw_params,
                 self.is_server,
                 self.peer_transport_params_track_unknown,
             )?;
+            self.mp_use_0x3e = mp_use_0x3e;
 
             self.parse_peer_transport_params(peer_params)?;
         }
@@ -10968,10 +10995,17 @@ impl TransportParams {
     fn decode(
         buf: &[u8], is_server: bool, unknown_size: Option<usize>,
     ) -> Result<TransportParams> {
+        Self::decode_with_mp(buf, is_server, unknown_size).map(|(tp, _)| tp)
+    }
+
+    fn decode_with_mp(
+        buf: &[u8], is_server: bool, unknown_size: Option<usize>,
+    ) -> Result<(TransportParams, bool)> {
         let mut params = octets::Octets::with_slice(buf);
         let mut seen_params = HashSet::new();
 
         let mut tp = TransportParams::default();
+        let mut mp_use_0x3e = false;
 
         if let Some(unknown_transport_param_tracking_size) = unknown_size {
             tp.unknown_params = Some(UnknownTransportParameters {
@@ -11119,6 +11153,11 @@ impl TransportParams {
                     tp.max_datagram_frame_size = Some(val.get_varint()?);
                 },
 
+                0x003e => {
+                    tp.initial_max_path_id = Some(val.get_varint()?);
+                    mp_use_0x3e = true;
+                },
+
                 0x0f739bbc1b666d0d => {
                     tp.initial_max_path_id = Some(val.get_varint()?);
                 },
@@ -11143,6 +11182,11 @@ impl TransportParams {
 
                 // Track unknown transport parameters specially.
                 unknown_tp_id => {
+                    trace!(
+                        "Unknown transport parameter id={:#x} val={:?}",
+                        unknown_tp_id,
+                        val.buf()
+                    );
                     if let Some(unknown_params) = &mut tp.unknown_params {
                         // It is _not_ an error not to have space enough to track
                         // an unknown parameter.
@@ -11155,7 +11199,7 @@ impl TransportParams {
             }
         }
 
-        Ok(tp)
+        Ok((tp, mp_use_0x3e))
     }
 
     fn encode_param(
@@ -11313,6 +11357,14 @@ impl TransportParams {
         }
 
         if let Some(initial_max_path_id) = tp.initial_max_path_id {
+            if tp.flexicast_support {
+                TransportParams::encode_param(
+                    &mut b,
+                    0x003e,
+                    octets::varint_len(initial_max_path_id),
+                )?;
+                b.put_varint(initial_max_path_id)?;
+            }
             TransportParams::encode_param(
                 &mut b,
                 0x0f739bbc1b666d0d,
